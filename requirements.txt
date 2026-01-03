@@ -1,5 +1,10 @@
 streamlit
-torch==2.0.0
-transformers==4.36.2
+torch==2.0.1+cpu
+torchvision==0.15.2+cpu
+torchaudio==2.0.2+cpu
+transformers
+sentencepiece
 numpy
+pandas
 scikit-learn
+Pillow
