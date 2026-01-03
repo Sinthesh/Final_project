@@ -1,3 +1,5 @@
-torch
+streamlit
+torch==2.0.1+cpu
 transformers
 numpy
+scikit-learn
