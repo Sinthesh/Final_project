@@ -62,7 +62,7 @@ if not os.path.exists(MODEL_PATH):
         zip_ref.extractall(MODEL_EXTRACT_DIR)
 
 # ===============================
-# Load Tokenizer (from repo root)
+# Load Tokenizer
 # ===============================
 @st.cache_resource
 def load_tokenizer():
@@ -119,11 +119,37 @@ def load_emotion_model():
     return pipeline(
         "text-classification",
         model="j-hartmann/emotion-english-distilroberta-base",
-        return_all_scores=True,
+        top_k=None,
         device=0 if DEVICE == "cuda" else -1
     )
 
 emotion_classifier = load_emotion_model()
+
+# ===============================
+# FIXED SENTIMENT LOGIC
+# ===============================
+def map_sentiment(prob):
+    distance = abs(prob - 0.5)
+
+    # Neutral zone
+    if distance < 0.08:
+        return "Neutral 😐", prob
+
+    # Mild sentiment
+    if distance < 0.18:
+        return ("Positive 🙂", prob) if prob > 0.5 else ("Negative 🙁", prob)
+
+    # Strong sentiment (Very labels need HIGH certainty)
+    if prob > 0.75:
+        return "Very Positive 😄", prob
+    if prob < 0.25:
+        return "Very Negative 😡", prob
+
+    # Fallback
+    return ("Positive 🙂", prob) if prob > 0.5 else ("Negative 🙁", prob)
+
+def should_show_emotion(prob):
+    return abs(prob - 0.5) >= 0.15
 
 # ===============================
 # Prediction Function
@@ -146,25 +172,27 @@ def predict(text):
         logit = model(**inputs)
         raw_prob = torch.sigmoid(logit).item()
 
-    # Calibration
+    # Calibration (kept)
     prob = 0.5 + (raw_prob - 0.5) * 0.6
     prob = max(0.0, min(1.0, prob))
-    distance = abs(prob - 0.5)
 
-    if prob >= 0.5:
-        sentiment = "Very Positive 😄" if distance >= 0.28 else "Positive 🙂"
-    else:
-        sentiment = "Very Negative 😡" if distance >= 0.28 else "Negative 🙁"
+    sentiment, prob = map_sentiment(prob)
 
+    # Certainty (better than raw prob)
+    certainty = round(abs(prob - 0.5) * 2, 3)
+
+    # Emotion handling
     emotion_scores = emotion_classifier(text)[0]
     top_emotion = max(emotion_scores, key=lambda x: x["score"])
 
-    return (
-        sentiment,
-        round(prob, 4),
-        top_emotion["label"],
-        round(top_emotion["score"], 4)
-    )
+    if should_show_emotion(prob):
+        emotion = top_emotion["label"]
+        emotion_conf = round(top_emotion["score"], 3)
+    else:
+        emotion = "neutral"
+        emotion_conf = 0.0
+
+    return sentiment, certainty, emotion, emotion_conf
 
 # ===============================
 # UI
@@ -179,11 +207,11 @@ if st.button("Analyze"):
     if review.strip() == "":
         st.warning("Please enter some text.")
     else:
-        sentiment, confidence, emotion, emotion_cf = predict(review)
+        sentiment, certainty, emotion, emotion_cf = predict(review)
 
         st.subheader("🔍 Prediction Results")
         st.markdown(f"**Sentiment:** {sentiment}")
-        st.markdown(f"**Sentiment Confidence:** `{confidence}`")
+        st.markdown(f"**Sentiment Certainty:** `{certainty}`")
         st.markdown(f"**Emotion:** `{emotion}`")
         st.markdown(f"**Emotion Confidence:** `{emotion_cf}`")
 
