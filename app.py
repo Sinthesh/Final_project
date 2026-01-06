@@ -93,7 +93,10 @@ class BertBiLSTM(torch.nn.Module):
             return_dict=True
         )
         lstm_out, _ = self.lstm(outputs.last_hidden_state)
-        pooled = torch.mean(lstm_out * attention_mask.unsqueeze(-1), dim=1)
+        pooled = torch.sum(
+            lstm_out * attention_mask.unsqueeze(-1),
+            dim=1
+        ) / attention_mask.sum(dim=1, keepdim=True)
         logits = self.classifier(pooled)
         return logits.squeeze(-1)
 
@@ -126,30 +129,22 @@ def load_emotion_model():
 emotion_classifier = load_emotion_model()
 
 # ===============================
-# FIXED SENTIMENT LOGIC
+# Sentiment Mapping (FIXED)
 # ===============================
 def map_sentiment(prob):
-    distance = abs(prob - 0.5)
-
-    # Neutral zone
-    if distance < 0.08:
-        return "Neutral 😐", prob
-
-    # Mild sentiment
-    if distance < 0.18:
-        return ("Positive 🙂", prob) if prob > 0.5 else ("Negative 🙁", prob)
-
-    # Strong sentiment (Very labels need HIGH certainty)
-    if prob > 0.75:
-        return "Very Positive 😄", prob
-    if prob < 0.25:
-        return "Very Negative 😡", prob
-
-    # Fallback
-    return ("Positive 🙂", prob) if prob > 0.5 else ("Negative 🙁", prob)
-
-def should_show_emotion(prob):
-    return abs(prob - 0.5) >= 0.15
+    """
+    Soft, interpretable mapping from binary probability
+    """
+    if prob >= 0.80:
+        return "Very Positive 😄"
+    elif prob >= 0.60:
+        return "Positive 🙂"
+    elif prob > 0.40:
+        return "Neutral 😐"
+    elif prob > 0.20:
+        return "Negative 🙁"
+    else:
+        return "Very Negative 😡"
 
 # ===============================
 # Prediction Function
@@ -170,29 +165,19 @@ def predict(text):
 
     with torch.no_grad():
         logit = model(**inputs)
-        raw_prob = torch.sigmoid(logit).item()
+        prob = torch.sigmoid(logit).item()
 
-    # Calibration (kept)
-    prob = 0.5 + (raw_prob - 0.5) * 0.6
-    prob = max(0.0, min(1.0, prob))
+    sentiment = map_sentiment(prob)
 
-    sentiment, prob = map_sentiment(prob)
-
-    # Certainty (better than raw prob)
-    certainty = round(abs(prob - 0.5) * 2, 3)
-
-    # Emotion handling
     emotion_scores = emotion_classifier(text)[0]
     top_emotion = max(emotion_scores, key=lambda x: x["score"])
 
-    if should_show_emotion(prob):
-        emotion = top_emotion["label"]
-        emotion_conf = round(top_emotion["score"], 3)
-    else:
-        emotion = "neutral"
-        emotion_conf = 0.0
-
-    return sentiment, certainty, emotion, emotion_conf
+    return (
+        sentiment,
+        round(prob, 3),
+        top_emotion["label"],
+        round(top_emotion["score"], 3)
+    )
 
 # ===============================
 # UI
@@ -207,13 +192,13 @@ if st.button("Analyze"):
     if review.strip() == "":
         st.warning("Please enter some text.")
     else:
-        sentiment, certainty, emotion, emotion_cf = predict(review)
+        sentiment, confidence, emotion, emotion_cf = predict(review)
 
         st.subheader("🔍 Prediction Results")
         st.markdown(f"**Sentiment:** {sentiment}")
-        st.markdown(f"**Sentiment Certainty:** `{certainty}`")
+        st.markdown(f"**Sentiment Certainty:** `{confidence}`")
         st.markdown(f"**Emotion:** `{emotion}`")
         st.markdown(f"**Emotion Confidence:** `{emotion_cf}`")
 
 st.markdown("---")
-st.caption("BERT + BiLSTM Sentiment Model with Emotion-Aware Inference")
+st.caption("BERT + BiLSTM Sentiment Model with Independent Emotion Detection")
