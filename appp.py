@@ -66,7 +66,7 @@ if not os.path.exists(MODEL_PATH):
 # ===============================
 @st.cache_resource
 def load_tokenizer():
-    return AutoTokenizer.from_pretrained(".")
+    return AutoTokenizer.from_pretrained("bert-base-uncased")
 
 tokenizer = load_tokenizer()
 
@@ -126,30 +126,20 @@ def load_emotion_model():
 emotion_classifier = load_emotion_model()
 
 # ===============================
-# FIXED SENTIMENT LOGIC
+# Improved Sentiment Mapping
 # ===============================
 def map_sentiment(prob):
-    distance = abs(prob - 0.5)
 
-    # Neutral zone
-    if distance < 0.08:
-        return "Neutral 😐", prob
-
-    # Mild sentiment
-    if distance < 0.18:
-        return ("Positive 🙂", prob) if prob > 0.5 else ("Negative 🙁", prob)
-
-    # Strong sentiment (Very labels need HIGH certainty)
-    if prob > 0.75:
-        return "Very Positive 😄", prob
-    if prob < 0.25:
-        return "Very Negative 😡", prob
-
-    # Fallback
-    return ("Positive 🙂", prob) if prob > 0.5 else ("Negative 🙁", prob)
-
-def should_show_emotion(prob):
-    return abs(prob - 0.5) >= 0.15
+    if prob >= 0.85:
+        return "Very Positive 😄"
+    elif prob >= 0.65:
+        return "Positive 🙂"
+    elif prob >= 0.45:
+        return "Neutral 😐"
+    elif prob >= 0.25:
+        return "Negative 🙁"
+    else:
+        return "Very Negative 😡"
 
 # ===============================
 # Prediction Function
@@ -170,25 +160,22 @@ def predict(text):
 
     with torch.no_grad():
         logit = model(**inputs)
-        raw_prob = torch.sigmoid(logit).item()
+        prob = torch.sigmoid(logit).item()   # ✅ RAW PROB (no calibration)
 
-    # Calibration (kept)
-    prob = 0.5 + (raw_prob - 0.5) * 0.6
-    prob = max(0.0, min(1.0, prob))
+    sentiment = map_sentiment(prob)
 
-    sentiment, prob = map_sentiment(prob)
-
-    # Certainty (better than raw prob)
+    # Better certainty (0 to 1 scale)
     certainty = round(abs(prob - 0.5) * 2, 3)
 
-    # Emotion handling
+    # Emotion
     emotion_scores = emotion_classifier(text)[0]
     top_emotion = max(emotion_scores, key=lambda x: x["score"])
 
-    if should_show_emotion(prob):
-        emotion = top_emotion["label"]
-        emotion_conf = round(top_emotion["score"], 3)
-    else:
+    emotion = top_emotion["label"]
+    emotion_conf = round(top_emotion["score"], 3)
+
+    # Soft alignment (only for neutral cases)
+    if "Neutral" in sentiment:
         emotion = "neutral"
         emotion_conf = 0.0
 
