@@ -126,17 +126,36 @@ def load_emotion_model():
 emotion_classifier = load_emotion_model()
 
 # ===============================
-# Improved Sentiment Mapping
+# NEGATION HANDLING
+# ===============================
+def handle_negation(text):
+    text = text.lower()
+
+    replacements = {
+        "not good": "bad",
+        "not bad": "good",
+        "not great": "average",
+        "not terrible": "average",
+        "not boring": "interesting",
+        "not interesting": "boring"
+    }
+
+    for k, v in replacements.items():
+        text = text.replace(k, v)
+
+    return text
+
+# ===============================
+# SENTIMENT MAPPING
 # ===============================
 def map_sentiment(prob):
-
-    if prob >= 0.85:
+    if prob >= 0.80:
         return "Very Positive 😄"
-    elif prob >= 0.65:
+    elif prob >= 0.60:
         return "Positive 🙂"
-    elif prob >= 0.45:
+    elif prob >= 0.40:
         return "Neutral 😐"
-    elif prob >= 0.25:
+    elif prob >= 0.20:
         return "Negative 🙁"
     else:
         return "Very Negative 😡"
@@ -145,8 +164,12 @@ def map_sentiment(prob):
 # Prediction Function
 # ===============================
 def predict(text):
+
+    # 🔥 Apply negation fix
+    processed_text = handle_negation(text)
+
     enc = tokenizer(
-        text,
+        processed_text,
         return_tensors="pt",
         truncation=True,
         padding=True,
@@ -160,11 +183,10 @@ def predict(text):
 
     with torch.no_grad():
         logit = model(**inputs)
-        prob = torch.sigmoid(logit).item()   # ✅ RAW PROB (no calibration)
+        prob = torch.sigmoid(logit).item()
 
     sentiment = map_sentiment(prob)
 
-    # Better certainty (0 to 1 scale)
     certainty = round(abs(prob - 0.5) * 2, 3)
 
     # Emotion
@@ -174,10 +196,16 @@ def predict(text):
     emotion = top_emotion["label"]
     emotion_conf = round(top_emotion["score"], 3)
 
-    # Soft alignment (only for neutral cases)
+    # 🔥 Smart alignment
     if "Neutral" in sentiment:
         emotion = "neutral"
         emotion_conf = 0.0
+
+    if "Very Positive" in sentiment and emotion in ["sadness", "anger", "disgust"]:
+        emotion = "joy"
+
+    if "Very Negative" in sentiment and emotion == "joy":
+        emotion = "disgust"
 
     return sentiment, certainty, emotion, emotion_conf
 
