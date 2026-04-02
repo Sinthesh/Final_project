@@ -4,6 +4,7 @@ from transformers import AutoTokenizer, AutoModel, pipeline
 import zipfile
 import os
 import base64
+import re
 
 # ===============================
 # Page Configuration
@@ -66,7 +67,7 @@ if not os.path.exists(MODEL_PATH):
 # ===============================
 @st.cache_resource
 def load_tokenizer():
-    return AutoTokenizer.from_pretrained("bert-base-uncased")
+    return AutoTokenizer.from_pretrained(".")
 
 tokenizer = load_tokenizer()
 
@@ -126,46 +127,24 @@ def load_emotion_model():
 emotion_classifier = load_emotion_model()
 
 # ===============================
-# NEGATION HANDLING
+# Negation Handling (IMPORTANT)
 # ===============================
 def handle_negation(text):
     text = text.lower()
 
-    replacements = {
-        "not good": "bad",
-        "not bad": "good",
-        "not great": "average",
-        "not terrible": "average",
-        "not boring": "interesting",
-        "not interesting": "boring"
-    }
-
-    for k, v in replacements.items():
-        text = text.replace(k, v)
+    # simple but effective negation rules
+    text = re.sub(r"\bnot good\b", "bad", text)
+    text = re.sub(r"\bnot bad\b", "good", text)
+    text = re.sub(r"\bnot great\b", "average", text)
+    text = re.sub(r"\bnot terrible\b", "average", text)
 
     return text
-
-# ===============================
-# SENTIMENT MAPPING
-# ===============================
-def map_sentiment(prob):
-    if prob >= 0.80:
-        return "Very Positive 😄"
-    elif prob >= 0.60:
-        return "Positive 🙂"
-    elif prob >= 0.40:
-        return "Neutral 😐"
-    elif prob >= 0.20:
-        return "Negative 🙁"
-    else:
-        return "Very Negative 😡"
 
 # ===============================
 # Prediction Function
 # ===============================
 def predict(text):
 
-    # 🔥 Apply negation fix
     processed_text = handle_negation(text)
 
     enc = tokenizer(
@@ -185,27 +164,42 @@ def predict(text):
         logit = model(**inputs)
         prob = torch.sigmoid(logit).item()
 
-    sentiment = map_sentiment(prob)
+    # ===============================
+    # SENTIMENT LOGIC (FIXED)
+    # ===============================
+    if 0.40 <= prob <= 0.60:
+        sentiment = "Neutral 😐"
+    elif prob > 0.60:
+        sentiment = "Positive 🙂" if prob < 0.80 else "Very Positive 😄"
+    else:
+        sentiment = "Negative 🙁" if prob > 0.20 else "Very Negative 😡"
 
-    certainty = round(abs(prob - 0.5) * 2, 3)
+    # ===============================
+    # CERTAINTY (FIXED)
+    # ===============================
+    certainty = round(max(prob, 1 - prob), 3)
 
-    # Emotion
+    # ===============================
+    # EMOTION
+    # ===============================
     emotion_scores = emotion_classifier(text)[0]
     top_emotion = max(emotion_scores, key=lambda x: x["score"])
 
     emotion = top_emotion["label"]
     emotion_conf = round(top_emotion["score"], 3)
 
-    # 🔥 Smart alignment
-    if "Neutral" in sentiment:
+    # ===============================
+    # ALIGNMENT FIX
+    # ===============================
+    if sentiment == "Neutral 😐":
         emotion = "neutral"
         emotion_conf = 0.0
 
-    if "Very Positive" in sentiment and emotion in ["sadness", "anger", "disgust"]:
+    if sentiment in ["Very Positive 😄", "Positive 🙂"] and emotion in ["sadness", "anger", "disgust"]:
         emotion = "joy"
 
-    if "Very Negative" in sentiment and emotion == "joy":
-        emotion = "disgust"
+    if sentiment in ["Very Negative 😡", "Negative 🙁"] and emotion == "joy":
+        emotion = "sadness"
 
     return sentiment, certainty, emotion, emotion_conf
 
@@ -222,11 +216,11 @@ if st.button("Analyze"):
     if review.strip() == "":
         st.warning("Please enter some text.")
     else:
-        sentiment, certainty, emotion, emotion_cf = predict(review)
+        sentiment, confidence, emotion, emotion_cf = predict(review)
 
         st.subheader("🔍 Prediction Results")
         st.markdown(f"**Sentiment:** {sentiment}")
-        st.markdown(f"**Sentiment Certainty:** `{certainty}`")
+        st.markdown(f"**Sentiment Certainty:** `{confidence}`")
         st.markdown(f"**Emotion:** `{emotion}`")
         st.markdown(f"**Emotion Confidence:** `{emotion_cf}`")
 
