@@ -69,12 +69,7 @@ sentiment_classifier = load_sentiment_model()
 emotion_classifier   = load_emotion_model()
 
 # ===============================
-# Emotion grouping
-# Maps the 7 emotion labels into 3 buckets so alignment
-# logic is simple and reliable.
-# Positive bucket : joy, surprise
-# Negative bucket : sadness, anger, disgust, fear
-# Neutral  bucket : neutral
+# Emotion buckets
 # ===============================
 POSITIVE_EMOTIONS = {"joy", "surprise"}
 NEGATIVE_EMOTIONS = {"sadness", "anger", "disgust", "fear"}
@@ -90,22 +85,18 @@ def emotion_bucket(label: str) -> str:
 # Predict
 # ===============================
 def predict(text: str):
-    scores     = sentiment_classifier(text[:512])[0]
-    score_map  = {s["label"].lower(): s["score"] for s in scores}
+    # --- Sentiment ---
+    scores    = sentiment_classifier(text[:512])[0]
+    score_map = {s["label"].lower(): s["score"] for s in scores}
 
-    neg_score  = score_map.get("negative", 0.0)
-    neu_score  = score_map.get("neutral",  0.0)
-    pos_score  = score_map.get("positive", 0.0)
-    top_score  = max(neg_score, neu_score, pos_score)
+    neg_score = score_map.get("negative", 0.0)
+    neu_score = score_map.get("neutral",  0.0)
+    pos_score = score_map.get("positive", 0.0)
+    top_score = max(neg_score, neu_score, pos_score)
 
-    # ---- Sentiment decision ----
-    # If the winning class score is below 0.55, the model is
-    # uncertain → call it Neutral regardless of top label.
-    # This handles "I didn't love it but didn't hate it" correctly.
     if top_score < 0.55:
         sentiment = "Neutral 😐"
-        certainty = round(neu_score + top_score * 0.3, 3)   # reasonable display value
-        certainty = min(round(certainty, 3), 0.80)
+        certainty = round(top_score, 3)
     elif pos_score == top_score:
         sentiment = "Positive 🙂"
         certainty = round(pos_score, 3)
@@ -116,38 +107,69 @@ def predict(text: str):
         sentiment = "Neutral 😐"
         certainty = round(neu_score, 3)
 
-    # ---- Emotion ----
+    # --- Emotion ---
     emo_scores   = emotion_classifier(text[:512])[0]
+    emo_map      = {e["label"]: e["score"] for e in emo_scores}
     top_emo      = max(emo_scores, key=lambda x: x["score"])
     emotion      = top_emo["label"]
     emotion_conf = round(top_emo["score"], 3)
 
-    # ---- Emotion alignment ----
-    # Rule: if sentiment and emotion bucket are opposites,
-    # pick the highest-scoring emotion FROM the matching bucket.
     sent_bucket = (
         "positive" if "Positive" in sentiment else
         "negative" if "Negative" in sentiment else
         "neutral"
     )
-    emo_b = emotion_bucket(emotion)
+
+    # ---- Emotion alignment rules ----
 
     if sent_bucket == "neutral":
-        # For neutral sentiment, prefer neutral emotion if available
-        neutral_score = next((e["score"] for e in emo_scores if e["label"] == "neutral"), 0)
-        if neutral_score > 0.20:
-            emotion      = "neutral"
-            emotion_conf = round(neutral_score, 3)
+        # For neutral sentiment: pick best from {neutral, surprise}
+        # These are the only emotions that make sense for mixed/ambiguous reviews.
+        # Anger, disgust, sadness on a neutral review = emotion model confused by
+        # individual negative words, not the overall tone.
+        calm_emotions = ["neutral", "surprise"]
+        best_calm = max(calm_emotions, key=lambda e: emo_map.get(e, 0.0))
+        emotion      = best_calm
+        emotion_conf = round(emo_map.get(best_calm, 0.0), 3)
 
-    elif emo_b != sent_bucket and emotion_conf > 0.50:
-        # Clear contradiction with high confidence → fix it
-        matching = [e for e in emo_scores if emotion_bucket(e["label"]) == sent_bucket]
-        if matching:
-            best_match   = max(matching, key=lambda x: x["score"])
-            emotion      = best_match["label"]
-            emotion_conf = round(best_match["score"], 3)
+    elif sent_bucket == "positive":
+        # For positive: only joy or surprise make sense
+        if emotion not in POSITIVE_EMOTIONS:
+            best_pos = max(POSITIVE_EMOTIONS, key=lambda e: emo_map.get(e, 0.0))
+            emotion      = best_pos
+            emotion_conf = round(emo_map.get(best_pos, 0.0), 3)
+
+    elif sent_bucket == "negative":
+        # For negative: only sadness, anger, disgust, fear make sense
+        if emotion not in NEGATIVE_EMOTIONS:
+            best_neg = max(NEGATIVE_EMOTIONS, key=lambda e: emo_map.get(e, 0.0))
+            emotion      = best_neg
+            emotion_conf = round(emo_map.get(best_neg, 0.0), 3)
 
     return sentiment, certainty, emotion, emotion_conf
+
+# ===============================
+# Confidence bar helper
+# ===============================
+def confidence_bar(label: str, value: float, color: str):
+    pct = int(value * 100)
+    st.markdown(
+        f"""
+        <div style="margin-bottom: 6px;">
+            <div style="display:flex; justify-content:space-between;
+                        font-size:13px; color:#ccc; margin-bottom:3px;">
+                <span>{label}</span><span>{value}</span>
+            </div>
+            <div style="background:#333; border-radius:6px; height:10px; width:100%;">
+                <div style="background:{color}; width:{pct}%;
+                            height:10px; border-radius:6px;
+                            transition: width 0.4s ease;">
+                </div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
 # ===============================
 # UI
@@ -166,10 +188,23 @@ if st.button("Analyze"):
             sentiment, certainty, emotion, emotion_conf = predict(review)
 
         st.subheader("🔍 Prediction Results")
+
+        # Sentiment label
         st.markdown(f"**Sentiment:** {sentiment}")
-        st.markdown(f"**Sentiment Certainty:** `{certainty}`")
+
+        # Confidence bar — color matches sentiment
+        bar_color = (
+            "#4CAF50" if "Positive" in sentiment else
+            "#F44336" if "Negative" in sentiment else
+            "#FFC107"
+        )
+        confidence_bar("Sentiment Certainty", certainty, bar_color)
+
+        st.markdown("")  # spacing
+
+        # Emotion
         st.markdown(f"**Emotion:** `{emotion}`")
-        st.markdown(f"**Emotion Confidence:** `{emotion_conf}`")
+        confidence_bar("Emotion Confidence", emotion_conf, "#7986CB")
 
 st.markdown("---")
 st.caption("Deployment: RoBERTa 3-class Sentiment · Emotion: DistilRoBERTa · Research: BERT+BiLSTM (92.2% F1)")
