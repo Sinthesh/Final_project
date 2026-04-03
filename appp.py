@@ -38,15 +38,9 @@ def set_background(image_path):
 
 set_background("background_image.jpg")
 
-# ===============================
-# Title
-# ===============================
 st.title("🎬 Sentiment & Emotion Analysis")
 st.write("Analyze movie reviews for sentiment intensity and emotional tone.")
 
-# ===============================
-# Device
-# ===============================
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ===============================
@@ -60,9 +54,6 @@ if not os.path.exists(MODEL_PATH):
     with zipfile.ZipFile(MODEL_ZIP, "r") as zip_ref:
         zip_ref.extractall(MODEL_EXTRACT_DIR)
 
-# ===============================
-# Load Tokenizer
-# ===============================
 @st.cache_resource
 def load_tokenizer():
     return AutoTokenizer.from_pretrained(".")
@@ -78,10 +69,8 @@ class BertBiLSTM(torch.nn.Module):
         self.bert = AutoModel.from_pretrained(pretrained_name)
         hidden_size = self.bert.config.hidden_size
         self.lstm = torch.nn.LSTM(
-            hidden_size,
-            lstm_hidden,
-            batch_first=True,
-            bidirectional=True
+            hidden_size, lstm_hidden,
+            batch_first=True, bidirectional=True
         )
         self.dropout = torch.nn.Dropout(0.3)
         self.classifier = torch.nn.Linear(lstm_hidden * 2, 1)
@@ -95,12 +84,8 @@ class BertBiLSTM(torch.nn.Module):
         lstm_out, _ = self.lstm(outputs.last_hidden_state)
         pooled = torch.mean(lstm_out * attention_mask.unsqueeze(-1), dim=1)
         x = self.dropout(pooled)
-        logits = self.classifier(x)
-        return logits.squeeze(-1)
+        return self.classifier(x).squeeze(-1)
 
-# ===============================
-# Load Sentiment Model
-# ===============================
 @st.cache_resource
 def load_sentiment_model():
     model = BertBiLSTM()
@@ -110,11 +95,6 @@ def load_sentiment_model():
     model.eval()
     return model
 
-model = load_sentiment_model()
-
-# ===============================
-# Load Emotion Model
-# ===============================
 @st.cache_resource
 def load_emotion_model():
     return pipeline(
@@ -124,112 +104,123 @@ def load_emotion_model():
         device=0 if DEVICE == "cuda" else -1
     )
 
+model = load_sentiment_model()
 emotion_classifier = load_emotion_model()
 
 # ===============================
-# Negation Handling
+# Negation preprocessing
 # ===============================
 def handle_negation(text):
-    text = text.lower()
-    text = re.sub(r"\bnot good\b", "bad", text)
-    text = re.sub(r"\bnot bad\b", "average", text)
-    text = re.sub(r"\bnot great\b", "average", text)
-    text = re.sub(r"\bnot terrible\b", "average", text)
-    text = re.sub(r"\bnot amazing\b", "average", text)
-    return text
+    t = text.lower()
+    t = re.sub(r"\bnot good\b", "bad", t)
+    t = re.sub(r"\bnot bad\b", "average", t)
+    t = re.sub(r"\bnot great\b", "average", t)
+    t = re.sub(r"\bnot terrible\b", "average", t)
+    t = re.sub(r"\bnot amazing\b", "average", t)
+    t = re.sub(r"\bnot awful\b", "average", t)
+    return t
 
 # ===============================
-# Calibration
-# BUG FIX: The raw sigmoid output from your IMDb model is heavily
-# biased toward extremes. Ambiguous/neutral reviews score near 0.1–0.2
-# instead of near 0.5. This calibration compresses the output
-# toward center, making neutral detection actually work.
-# Same logic as predict_sentiment_with_emotion() in your notebook.
+# Neutrality score from emotion model
+#
+# The emotion model (distilroberta) was trained on a much broader
+# dataset and handles ambiguous/neutral language better than our
+# IMDb-fine-tuned BERT. We use it as a "second opinion" specifically
+# for detecting neutral cases.
+#
+# neutrality_score = neutral_prob + partial surprise - polar penalty
+# If this is high (> 0.35) AND BERT is not confidently positive,
+# we trust the emotion model over BERT for neutral classification.
 # ===============================
-def calibrate_prob(raw_prob: float) -> float:
-    prob = 0.5 + (raw_prob - 0.5) * 0.6
-    return float(max(0.0, min(1.0, prob)))
+def get_neutrality_score(emotion_scores: list) -> tuple:
+    score_map = {e["label"]: e["score"] for e in emotion_scores}
+    neutral  = score_map.get("neutral",  0.0)
+    joy      = score_map.get("joy",      0.0)
+    sadness  = score_map.get("sadness",  0.0)
+    anger    = score_map.get("anger",    0.0)
+    disgust  = score_map.get("disgust",  0.0)
+    fear     = score_map.get("fear",     0.0)
+    surprise = score_map.get("surprise", 0.0)
+
+    polar_strength = max(joy, sadness, anger, disgust, fear)
+    neutrality = neutral + 0.4 * surprise - 0.3 * polar_strength
+
+    top = max(emotion_scores, key=lambda x: x["score"])
+    return neutrality, top["label"], round(top["score"], 3)
 
 # ===============================
-# Prediction Function
+# Core prediction
+#
+# Decision logic:
+#   - raw_prob >= 0.75  → Very Positive (BERT confident)
+#   - raw_prob >= 0.65  → Positive (BERT fairly confident)
+#   - raw_prob <= 0.15  → Very Negative (BERT confident)
+#   - raw_prob <= 0.30  → Negative (BERT fairly confident)
+#   - Everything else  → check emotion model neutrality score
+#     - neutrality > 0.35 → Neutral
+#     - otherwise        → Neutral (weak signal either way)
+#
+# WHY: Our BERT model outputs raw_prob ~0.05-0.20 for ambiguous
+# reviews (neutral, mixed) because IMDb training data is polarised.
+# Threshold-based calibration alone can't fix this. The emotion
+# model's neutral/surprise scores are a more reliable signal for
+# the middle ground.
 # ===============================
 def predict(text):
-    processed_text = handle_negation(text)
+    processed = handle_negation(text)
 
     enc = tokenizer(
-        processed_text,
-        return_tensors="pt",
-        truncation=True,
-        padding=True,
-        max_length=128
+        processed, return_tensors="pt",
+        truncation=True, padding=True, max_length=128
     )
-
-    inputs = {
-        "input_ids": enc["input_ids"].to(DEVICE),
-        "attention_mask": enc["attention_mask"].to(DEVICE)
-    }
+    inputs = {k: v.to(DEVICE) for k, v in enc.items()
+              if k in ["input_ids", "attention_mask"]}
 
     with torch.no_grad():
         logit = model(**inputs)
-        raw_prob = torch.sigmoid(logit).item()
+        raw_prob = float(torch.sigmoid(logit).item())
 
-    # Apply calibration (BUG FIX #1)
-    prob = calibrate_prob(raw_prob)
-
-    # ===============================
-    # SENTIMENT LOGIC
-    # Thresholds now work correctly because prob is calibrated.
-    # ===============================
-    if 0.40 <= prob <= 0.60:
-        sentiment = "Neutral 😐"
-    elif prob > 0.80:
-        sentiment = "Very Positive 😄"
-    elif prob > 0.60:
-        sentiment = "Positive 🙂"
-    elif prob < 0.20:
-        sentiment = "Very Negative 😡"
-    else:
-        sentiment = "Negative 🙁"
-
-    # ===============================
-    # CERTAINTY (BUG FIX #2)
-    # For neutral: certainty reflects how centered prob is.
-    # For polar: certainty is how far from 0.5.
-    # Show as percentage and round properly.
-    # ===============================
-    if sentiment == "Neutral 😐":
-        certainty = round(1.0 - abs(prob - 0.5) * 2, 3)
-    else:
-        certainty = round(max(prob, 1.0 - prob), 3)
-
-    # ===============================
-    # EMOTION
-    # Run on the ORIGINAL text (not negation-replaced),
-    # since the emotion model handles negation natively.
-    # ===============================
+    # Run emotion model on original text (not negation-replaced)
     emotion_scores = emotion_classifier(text)[0]
-    top_emotion = max(emotion_scores, key=lambda x: x["score"])
-    emotion = top_emotion["label"]
-    emotion_conf = round(top_emotion["score"], 3)
+    neutrality, top_emotion, top_emotion_conf = get_neutrality_score(emotion_scores)
 
-    # ===============================
-    # ALIGNMENT FIX (BUG FIX #3)
-    # Less aggressive — only override clear contradictions.
-    # ===============================
-    if sentiment == "Neutral 😐":
-        # For true neutral, soften extreme emotions
-        if emotion_conf < 0.5:
-            emotion = "neutral"
-            emotion_conf = 0.0
+    # ---- Sentiment decision ----
+    if raw_prob >= 0.75:
+        sentiment = "Very Positive 😄"
+        certainty = round(raw_prob, 3)
 
-    # Only override very strong contradictions (very positive + very sad, etc.)
-    if sentiment == "Very Positive 😄" and emotion in ["sadness", "disgust"] and emotion_conf > 0.7:
+    elif raw_prob >= 0.65:
+        sentiment = "Positive 🙂"
+        certainty = round(raw_prob, 3)
+
+    elif raw_prob <= 0.15:
+        sentiment = "Very Negative 😡"
+        certainty = round(1.0 - raw_prob, 3)
+
+    elif raw_prob <= 0.30:
+        # BERT says negative, but check: is it actually neutral?
+        if neutrality > 0.35:
+            sentiment = "Neutral 😐"
+            certainty = round(min(0.5 + neutrality * 0.4, 0.85), 3)
+        else:
+            sentiment = "Negative 🙁"
+            certainty = round(1.0 - raw_prob, 3)
+
+    else:
+        # 0.30 < raw_prob < 0.65 → ambiguous zone, trust neutrality
+        sentiment = "Neutral 😐"
+        certainty = round(min(0.5 + neutrality * 0.4, 0.85), 3)
+
+    # ---- Light emotion alignment (only clear contradictions) ----
+    emotion = top_emotion
+    emotion_conf = top_emotion_conf
+
+    if sentiment == "Very Positive 😄" and emotion in ["sadness", "disgust"] and emotion_conf > 0.75:
         emotion = "joy"
-
-    if sentiment == "Very Negative 😡" and emotion == "joy" and emotion_conf > 0.7:
+    if sentiment == "Very Negative 😡" and emotion == "joy" and emotion_conf > 0.75:
         emotion = "sadness"
 
-    return sentiment, certainty, emotion, emotion_conf, round(prob, 4)
+    return sentiment, certainty, emotion, emotion_conf, round(raw_prob, 4)
 
 # ===============================
 # UI
@@ -244,7 +235,8 @@ if st.button("Analyze"):
     if review.strip() == "":
         st.warning("Please enter some text.")
     else:
-        sentiment, certainty, emotion, emotion_cf, calibrated_prob = predict(review)
+        with st.spinner("Analyzing..."):
+            sentiment, certainty, emotion, emotion_cf, raw_prob = predict(review)
 
         st.subheader("🔍 Prediction Results")
         st.markdown(f"**Sentiment:** {sentiment}")
@@ -252,10 +244,10 @@ if st.button("Analyze"):
         st.markdown(f"**Emotion:** `{emotion}`")
         st.markdown(f"**Emotion Confidence:** `{emotion_cf}`")
 
-        # Debug expander — remove before final submission
-        with st.expander("🔧 Debug Info"):
-            st.write(f"Calibrated probability: `{calibrated_prob}`")
-            st.write("(0.0 = very negative, 0.5 = neutral, 1.0 = very positive)")
+        with st.expander("🔧 Debug Info (remove before submission)"):
+            st.write(f"Raw BERT sigmoid: `{raw_prob}`")
+            st.write("0.0 = strongly negative, 1.0 = strongly positive")
+            st.write("Values below 0.30 on neutral reviews = model bias from IMDb training")
 
 st.markdown("---")
-st.caption("BERT + BiLSTM Sentiment Model with Emotion-Aware Inference")
+st.caption("BERT + BiLSTM Sentiment Model with Hybrid Emotion-Aware Inference")
